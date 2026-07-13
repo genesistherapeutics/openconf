@@ -31,6 +31,10 @@ _SUPPORTED_MOVE_TYPES = frozenset(
 )
 _SUPPORTED_PARENT_STRATEGIES = frozenset({"softmax", "uniform", "best"})
 _SUPPORTED_FINAL_SELECTIONS = frozenset({"energy", "diverse"})
+_DEFAULT_INTERNAL_FORCE_CONSTANT = 100000.0
+_DEFAULT_BOND_TOLERANCE = 0.01
+_DEFAULT_ANGLE_TOLERANCE_DEG = 0.5
+_DEFAULT_TORSION_TOLERANCE_DEG = 0.5
 
 
 def _require_at_least(name: str, value: float, minimum: float) -> None:
@@ -69,13 +73,113 @@ def _validate_move_probs(move_probs: dict[str, float]) -> None:
         raise OpenConfValueError("move_probs must sum to a positive value.")
 
 
+def _require_atom_indices(name: str, atoms: tuple[int, ...], count: int) -> None:
+    if len(atoms) != count:
+        raise OpenConfValueError(f"{name} must contain exactly {count} atom indices.")
+    if any(atom < 0 for atom in atoms):
+        raise OpenConfValueError(f"{name} atom indices must be >= 0.")
+    if len(set(atoms)) != count:
+        raise OpenConfValueError(f"{name} atom indices must be distinct.")
+
+
+@dataclass(frozen=True)
+class BondConstraintSpec:
+    """Specification for bond-distance constraint.
+
+    Omit `distance` to freeze current distance from first input conformer.
+
+    Attributes:
+        atom_i: first atom index
+        atom_j: second atom index
+        distance: target distance in Angstrom, or None to use reference conformer
+        tolerance: allowed half-width around target distance in Angstrom
+        force_constant: force constant in kcal/mol/A^2
+    """
+
+    atom_i: int
+    atom_j: int
+    distance: float | None = None
+    tolerance: float = _DEFAULT_BOND_TOLERANCE
+    force_constant: float = _DEFAULT_INTERNAL_FORCE_CONSTANT
+
+    def __post_init__(self) -> None:
+        _require_atom_indices("BondConstraintSpec", (self.atom_i, self.atom_j), 2)
+        _require_optional_at_least("distance", self.distance, 0.0)
+        _require_at_least("tolerance", self.tolerance, 0.0)
+        _require_greater_than("force_constant", self.force_constant, 0.0)
+
+
+@dataclass(frozen=True)
+class AngleConstraintSpec:
+    """Specification for valence-angle constraint.
+
+    Omit `angle_deg` to freeze current angle from first input conformer.
+
+    Attributes:
+        atom_i: first atom index
+        atom_j: central atom index
+        atom_k: third atom index
+        angle_deg: target angle in degrees, or None to use reference conformer
+        tolerance_deg: allowed half-width around target angle in degrees
+        force_constant: force constant in kcal/mol/rad^2
+    """
+
+    atom_i: int
+    atom_j: int
+    atom_k: int
+    angle_deg: float | None = None
+    tolerance_deg: float = _DEFAULT_ANGLE_TOLERANCE_DEG
+    force_constant: float = _DEFAULT_INTERNAL_FORCE_CONSTANT
+
+    def __post_init__(self) -> None:
+        _require_atom_indices("AngleConstraintSpec", (self.atom_i, self.atom_j, self.atom_k), 3)
+        _require_optional_at_least("angle_deg", self.angle_deg, 0.0)
+        if self.angle_deg is not None and self.angle_deg > 180.0:
+            raise OpenConfValueError(f"angle_deg must be <= 180.0, got {self.angle_deg}.")
+        _require_at_least("tolerance_deg", self.tolerance_deg, 0.0)
+        _require_greater_than("force_constant", self.force_constant, 0.0)
+
+
+@dataclass(frozen=True)
+class TorsionConstraintSpec:
+    """Specification for dihedral-angle constraint.
+
+    Omit `dihedral_deg` to freeze current torsion from first input conformer.
+
+    Attributes:
+        atom_i: first atom index
+        atom_j: second atom index
+        atom_k: third atom index
+        atom_l: fourth atom index
+        dihedral_deg: target dihedral in degrees, or None to use reference conformer
+        tolerance_deg: allowed half-width around target dihedral in degrees
+        force_constant: force constant in kcal/mol/rad^2
+    """
+
+    atom_i: int
+    atom_j: int
+    atom_k: int
+    atom_l: int
+    dihedral_deg: float | None = None
+    tolerance_deg: float = _DEFAULT_TORSION_TOLERANCE_DEG
+    force_constant: float = _DEFAULT_INTERNAL_FORCE_CONSTANT
+
+    def __post_init__(self) -> None:
+        _require_atom_indices("TorsionConstraintSpec", (self.atom_i, self.atom_j, self.atom_k, self.atom_l), 4)
+        if self.dihedral_deg is not None and not -360.0 <= self.dihedral_deg <= 360.0:
+            raise OpenConfValueError(f"dihedral_deg must be between -360.0 and 360.0, got {self.dihedral_deg}.")
+        _require_at_least("tolerance_deg", self.tolerance_deg, 0.0)
+        _require_greater_than("force_constant", self.force_constant, 0.0)
+
+
 @dataclass
 class ConstraintSpec:
-    """Specification for positional constraints during conformer generation.
+    """Specification for geometry constraints during conformer generation.
 
     Used for FEP-style analogue generation where an MCS-aligned pose is provided
     and a subset of atoms (the core scaffold) must remain fixed while terminal
-    groups are explored.
+    groups are explored. Can also freeze or target internal coordinates using
+    bond, angle, and torsion constraint specifications.
 
     Attributes:
         constrained_atoms: Atom indices that must not move. These are indices
@@ -85,13 +189,36 @@ class ConstraintSpec:
         position_force_constant: MMFF force constant (kcal/mol/Å²) for the
             harmonic position restraints applied to constrained atoms.
             Default 1000.0 is very stiff and effectively freezes the core.
+        bond_constraints: bond-distance constraints
+        angle_constraints: valence-angle constraints
+        torsion_constraints: dihedral-angle constraints
     """
 
-    constrained_atoms: frozenset[int]
+    constrained_atoms: frozenset[int] = frozenset()
     position_force_constant: float = 1000.0
+    bond_constraints: tuple[BondConstraintSpec, ...] = ()
+    angle_constraints: tuple[AngleConstraintSpec, ...] = ()
+    torsion_constraints: tuple[TorsionConstraintSpec, ...] = ()
 
     def __post_init__(self) -> None:
+        if any(atom < 0 for atom in self.constrained_atoms):
+            raise OpenConfValueError("constrained_atoms values must be >= 0.")
         _require_greater_than("position_force_constant", self.position_force_constant, 0.0)
+
+    @property
+    def requires_reference_geometry(self) -> bool:
+        """Return whether constraint targets must be read from input conformer."""
+        return bool(
+            self.constrained_atoms
+            or any(constraint.distance is None for constraint in self.bond_constraints)
+            or any(constraint.angle_deg is None for constraint in self.angle_constraints)
+            or any(constraint.dihedral_deg is None for constraint in self.torsion_constraints)
+        )
+
+    @property
+    def constrained_rotor_atoms(self) -> frozenset[int]:
+        """Atom indices whose movement should suppress torsion moves."""
+        return self.constrained_atoms
 
 
 @dataclass

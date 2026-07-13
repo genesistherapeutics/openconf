@@ -144,8 +144,18 @@ class HybridProposer:
             if constraint_spec is not None
             else ConstraintModel.empty()
         )
-        self.constraint_model = metal_constraints.combine(pose_constraints)
-        self._has_position_constraints = bool(self.constraint_model.position_constraints)
+        internal_constraints = (
+            ConstraintModel.from_internal_coordinates(
+                mol,
+                bond_constraints=constraint_spec.bond_constraints,
+                angle_constraints=constraint_spec.angle_constraints,
+                torsion_constraints=constraint_spec.torsion_constraints,
+            )
+            if constraint_spec is not None
+            else ConstraintModel.empty()
+        )
+        self.constraint_model = metal_constraints.combine(pose_constraints).combine(internal_constraints)
+        self._has_constraints = self.constraint_model.has_constraints
 
         self.fast_minimizer = get_minimizer(
             config.minimizer,
@@ -294,14 +304,19 @@ class HybridProposer:
         max_its = self.config.seed_minimization_iters
         nthreads = int(self.config.num_threads or 0)
 
-        if mmff_props is not None:
+        if mmff_props is not None and not self.constraint_model.has_constraints:
             minimize_start = time.perf_counter()
             energies = minimize_confs_mmff(self.mol, mmff_props, conf_ids, max_its, nthreads)
             self._add_time_stat("seed_minimization_time_s", time.perf_counter() - minimize_start)
             seed_results = list(zip(conf_ids, energies, strict=True))
         else:
             minimize_start = time.perf_counter()
-            seed_results = [(cid, self._minimize_uff_single(self.mol, cid, max_its)) for cid in conf_ids]
+            seed_results = [
+                (cid, self.fast_minimizer.minimize(self.mol, cid))
+                if mmff_props is not None
+                else (cid, self._minimize_uff_single(self.mol, cid, max_its))
+                for cid in conf_ids
+            ]
             self._add_time_stat("seed_minimization_time_s", time.perf_counter() - minimize_start)
 
         # Supplementary seeds covering cis/trans families that ETKDG undersamples
@@ -540,14 +555,14 @@ class HybridProposer:
         forced = resolve_forced_move(
             step,
             self.config.shake_period,
-            constrained=self._has_position_constraints,
+            constrained=self._has_constraints,
         )
         if forced is not None:
             return forced
 
         probs = resolve_move_probabilities(
             self._current_move_probs,
-            constrained=self._has_position_constraints,
+            constrained=self._has_constraints,
             has_ring_flips=bool(self.rotor_model.ring_flips),
             has_crankshaft=bool(self._moves.crankable_rings),
             has_kic=bool(self._moves.macro_kic_data),
@@ -777,9 +792,9 @@ class HybridProposer:
         staging props (fast_dielectric applied), then transfers accepted
         (finite-energy) conformers back to self.mol.
 
-        When constraint_spec is set, falls back to sequential per-conformer
-        minimization with MMFF position restraints (MMFFOptimizeMoleculeConfs
-        does not support custom force field terms).
+        When constraints are set, falls back to sequential per-conformer
+        minimization with explicit force-field terms because
+        MMFFOptimizeMoleculeConfs does not support custom constraints.
 
         Args:
             pool: conformer pool for parent selection
@@ -789,7 +804,7 @@ class HybridProposer:
             Accepted conformer IDs, energies, and sources
         """
         # Constraint mode: per-conformer minimization with explicit restraints.
-        if self.constraint_spec is not None or self.constraint_model.position_constraints:
+        if self.constraint_model.has_constraints:
             results: list[tuple[int, float, str]] = []
             for i in range(self.config.minimize_batch_size):
                 result = self._propose_constrained(pool, step + i)
@@ -891,7 +906,7 @@ class HybridProposer:
         Returns:
             Refined energies in kcal/mol aligned to `final_ids`
         """
-        assert self.constraint_spec is not None
+        assert self.constraint_model.has_constraints
 
         # Keep only finals before refining
         final_set = set(final_ids)
@@ -951,11 +966,13 @@ def run_hybrid_generation(
     stats = new_generation_stats() if config.collect_stats else {}
     constraint_spec = config.constraint_spec
     has_metal_input = any(_is_metal(atom) for atom in mol.GetAtoms()) and mol.GetNumConformers() > 0
-    use_input_seed = constraint_spec is not None or has_metal_input
+    use_input_seed = (
+        constraint_spec.requires_reference_geometry if constraint_spec is not None else False
+    ) or has_metal_input
 
     # Filter rotors before building the proposer so _rotor_angles is computed
     # only for free rotors.
-    if constraint_spec is not None:
+    if constraint_spec is not None and constraint_spec.constrained_rotor_atoms:
         rotor_model = filter_constrained_rotors(rotor_model, constraint_spec.constrained_atoms)
 
     effective_config, tuned_defaults_applied = _resolve_runtime_tuned_config(config, rotor_model)
@@ -1126,7 +1143,7 @@ def run_hybrid_generation(
 
     if effective_config.do_final_refine:
         final_refine_start = time.perf_counter()
-        if constraint_spec is not None:
+        if proposer.constraint_model.has_constraints:
             final_energies = proposer.full_refine_final_constrained(
                 mol, final_ids, effective_config.max_minimization_iters, dielectric=effective_config.final_dielectric
             )

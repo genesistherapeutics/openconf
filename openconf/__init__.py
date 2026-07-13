@@ -6,7 +6,15 @@ from .api import (
     generate_conformers,
     generate_conformers_from_pose,
 )
-from .config import ConformerConfig, ConformerPreset, ConstraintSpec, preset_config
+from .config import (
+    AngleConstraintSpec,
+    BondConstraintSpec,
+    ConformerConfig,
+    ConformerPreset,
+    ConstraintSpec,
+    TorsionConstraintSpec,
+    preset_config,
+)
 from .dedupe import prism_dedupe
 from .exceptions import OpenConfError, OpenConfRuntimeError, OpenConfValueError
 from .io import mol_to_smiles, read_sdf, read_xyz, smiles_to_mol, write_sdf, write_xyz
@@ -15,6 +23,8 @@ from .relax import RDKitMMFFMinimizer, get_minimizer
 from .torsionlib import TorsionLibrary, TorsionRule
 
 __all__ = [
+    "AngleConstraintSpec",
+    "BondConstraintSpec",
     "ConformerConfig",
     "ConformerEnsemble",
     "ConformerPreset",
@@ -26,6 +36,7 @@ __all__ = [
     "RDKitMMFFMinimizer",
     "Rotor",
     "RotorModel",
+    "TorsionConstraintSpec",
     "TorsionLibrary",
     "TorsionRule",
     "build_rotor_model",

@@ -358,6 +358,97 @@ def test_global_shake_suppressed_in_constrained_mode():
 
 
 # ---------------------------------------------------------------------------
+# Internal-coordinate constraints
+# ---------------------------------------------------------------------------
+
+
+def test_internal_coordinate_constraints_freeze_reference_geometry():
+    """Bond, angle, and torsion constraints can freeze input conformer values."""
+    from rdkit.Chem import rdMolTransforms
+
+    from openconf import (
+        AngleConstraintSpec,
+        BondConstraintSpec,
+        ConformerConfig,
+        ConstraintSpec,
+        TorsionConstraintSpec,
+        generate_conformers,
+    )
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCCC"))
+    AllChem.EmbedMolecule(mol, randomSeed=0)
+    conf = mol.GetConformer(0)
+    ref_distance = conf.GetAtomPosition(1).Distance(conf.GetAtomPosition(2))
+    ref_angle = rdMolTransforms.GetAngleDeg(conf, 0, 1, 2)
+    ref_torsion = rdMolTransforms.GetDihedralDeg(conf, 0, 1, 2, 3)
+
+    config = ConformerConfig(
+        max_out=3,
+        pool_max=10,
+        n_steps=8,
+        minimize_batch_size=1,
+        random_seed=0,
+        constraint_spec=ConstraintSpec(
+            bond_constraints=(BondConstraintSpec(1, 2),),
+            angle_constraints=(AngleConstraintSpec(0, 1, 2),),
+            torsion_constraints=(TorsionConstraintSpec(0, 1, 2, 3),),
+        ),
+    )
+    ensemble = generate_conformers(mol, config=config, add_hs=False)
+
+    assert ensemble.n_conformers > 0
+    for record in ensemble.records:
+        trial_conf = ensemble.mol.GetConformer(record.conf_id)
+        distance = trial_conf.GetAtomPosition(1).Distance(trial_conf.GetAtomPosition(2))
+        angle = rdMolTransforms.GetAngleDeg(trial_conf, 0, 1, 2)
+        torsion = rdMolTransforms.GetDihedralDeg(trial_conf, 0, 1, 2, 3)
+
+        assert abs(distance - ref_distance) <= 0.02
+        assert abs(angle - ref_angle) <= 1.0
+        assert abs(((torsion - ref_torsion + 180.0) % 360.0) - 180.0) <= 1.0
+
+
+def test_explicit_internal_coordinate_constraints_do_not_require_reference_conformer():
+    """Explicit bond, angle, and torsion targets work without input coordinates."""
+    from rdkit.Chem import rdMolTransforms
+
+    from openconf import (
+        AngleConstraintSpec,
+        BondConstraintSpec,
+        ConformerConfig,
+        ConstraintSpec,
+        TorsionConstraintSpec,
+        generate_conformers,
+    )
+
+    config = ConformerConfig(
+        max_out=2,
+        pool_max=10,
+        n_seeds=3,
+        n_steps=0,
+        minimize_batch_size=1,
+        random_seed=0,
+        constraint_spec=ConstraintSpec(
+            bond_constraints=(BondConstraintSpec(1, 2, distance=1.54, tolerance=0.02),),
+            angle_constraints=(AngleConstraintSpec(0, 1, 2, angle_deg=112.0, tolerance_deg=2.0),),
+            torsion_constraints=(TorsionConstraintSpec(0, 1, 2, 3, dihedral_deg=180.0, tolerance_deg=2.0),),
+        ),
+    )
+    ensemble = generate_conformers("CCCC", config=config)
+
+    assert ensemble.n_conformers > 0
+    for record in ensemble.records:
+        conf = ensemble.mol.GetConformer(record.conf_id)
+        distance = conf.GetAtomPosition(1).Distance(conf.GetAtomPosition(2))
+        angle = rdMolTransforms.GetAngleDeg(conf, 0, 1, 2)
+        torsion = rdMolTransforms.GetDihedralDeg(conf, 0, 1, 2, 3)
+
+        assert abs(distance - 1.54) <= 0.04
+        assert abs(angle - 112.0) <= 3.0
+        assert abs(((torsion - 180.0 + 180.0) % 360.0) - 180.0) <= 3.0
+
+
+# ---------------------------------------------------------------------------
 # SDF output
 # ---------------------------------------------------------------------------
 
