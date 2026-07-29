@@ -9,7 +9,7 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors3D, rdFreeSASA
 
 from .config import ConformerConfig
-from .dedupe import prism_dedupe
+from .dedupe import rmsd_dedupe
 
 
 def _energy_or_inf(energy: float | None) -> float:
@@ -366,7 +366,7 @@ class ConformerPool:
 
     def should_dedupe(self) -> bool:
         """Check if deduplication should be run."""
-        return self._steps_since_dedupe >= self.config.dedupe_period
+        return self.config.dedupe_rmsd_threshold is not None and self._steps_since_dedupe >= self.config.dedupe_period
 
     def dedupe(self) -> int:
         """Run deduplication on the pool.
@@ -374,7 +374,7 @@ class ConformerPool:
         Returns:
             Conformer count removed
         """
-        if self.size <= 1:
+        if self.size <= 1 or self.config.dedupe_rmsd_threshold is None:
             return 0
 
         old_size = self.size
@@ -382,11 +382,13 @@ class ConformerPool:
         # Get current conf_ids
         conf_ids = self.conf_ids
 
-        keep_ids = prism_dedupe(
+        keep_ids = rmsd_dedupe(
             self.mol,
             conf_ids,
+            self.energies,
             use_heavy_atoms_only=self.config.use_heavy_atoms_only,
-            max_deviation=self.config.prism_max_deviation,
+            rmsd_threshold=self.config.dedupe_rmsd_threshold,
+            max_atom_deviation=self.config.dedupe_max_atom_deviation,
         )
 
         # Remove duplicates
@@ -410,13 +412,13 @@ class ConformerPool:
     def select_final(self) -> list[int]:
         """Select final diverse conformers.
 
-        Uses PRISM deduplication, then takes the lowest-energy conformers
+        Uses Cartesian RMSD deduplication, then takes the lowest-energy conformers
         if still over max_out.
 
         Returns:
             Selected conformer IDs
         """
-        # Run final dedupe with PRISM
+        # Run final Cartesian RMSD dedupe.
         self.dedupe()
 
         if self.size <= self.config.max_out:

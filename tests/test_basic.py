@@ -231,7 +231,7 @@ def test_transition_metal_preset_config_values():
     assert config.parent_strategy == "uniform"
     assert config.do_final_refine is False
     assert config.minimize_batch_size == 1
-    assert config.prism_max_deviation == pytest.approx(0.005)
+    assert config.dedupe_rmsd_threshold == pytest.approx(0.25)
     assert config.tm_seed_move_attempts == 2
     assert config.final_select == "diverse"
     assert config.move_probs["tm_ligand_rotate"] == pytest.approx(0.25)
@@ -555,6 +555,9 @@ def test_diverse_final_selection_preserves_protected_seed():
         ({"parent_softmax_temperature_kcal": 0.0}, "parent_softmax_temperature_kcal"),
         ({"move_probs": {}}, "move_probs"),
         ({"move_probs": {"unknown": 1.0}}, "unsupported move types"),
+        ({"dedupe_rmsd_threshold": 0.0}, "dedupe_rmsd_threshold"),
+        ({"dedupe_rmsd_threshold": float("nan")}, "dedupe_rmsd_threshold"),
+        ({"dedupe_max_atom_deviation": 0.0}, "dedupe_max_atom_deviation"),
         ({"seed_prune_rms_thresh": -0.5}, "seed_prune_rms_thresh"),
         ({"seed_minimization_iters": -1}, "seed_minimization_iters"),
     ],
@@ -765,11 +768,11 @@ def test_reproducibility():
         assert abs(e1 - e2) < 0.01
 
 
-def test_prism_dedupe():
-    """Test that PRISM deduplication works."""
+def test_rmsd_dedupe():
+    """Test that Cartesian RMSD deduplication works."""
     from rdkit.Chem import AllChem
 
-    from openconf.dedupe import prism_dedupe
+    from openconf.dedupe import rmsd_dedupe
 
     mol = Chem.MolFromSmiles("CCCC")
     mol = Chem.AddHs(mol)
@@ -779,7 +782,7 @@ def test_prism_dedupe():
         AllChem.MMFFOptimizeMolecule(mol, confId=cid)
 
     conf_ids = [c.GetId() for c in mol.GetConformers()]
-    keep_ids = prism_dedupe(mol, conf_ids)
+    keep_ids = rmsd_dedupe(mol, conf_ids)
 
     assert len(keep_ids) > 0
     assert len(keep_ids) < len(conf_ids)

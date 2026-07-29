@@ -428,11 +428,15 @@ Each proposed conformer is minimized with MMFF94s to ensure physically reasonabl
 
 ### 4. Deduplication
 
-Uses PRISM Pruner for efficient duplicate removal via moment-of-inertia filtering followed by RMSD-based pruning.
+Uses fixed-correspondence Cartesian RMSD after proper-rotation Kabsch
+alignment. A maximum per-atom displacement guard prevents localized changes
+from averaging away, while rotation-invariant radial lower bounds avoid
+unnecessary alignments without removing conformers.
 
 ### 5. Selection
 
-Final selection returns the lowest-energy conformers after PRISM deduplication.
+Final selection returns the lowest-energy representatives after conservative
+Cartesian RMSD deduplication.
 
 For the full algorithm description and parameter tuning guide, see [SCIENCE.md](SCIENCE.md).
 
@@ -470,13 +474,12 @@ For macrocyclic systems (ring size ≥ 12) the default configuration trails ETKD
 - `prepare_molecule(mol)` - Sanitize and add hydrogens
 - `build_rotor_model(mol)` - Identify rotatable bonds and flippable rings
 - `TorsionLibrary` - 365 crystallography-derived SMARTS torsion rules; load custom rules with `TorsionLibrary.from_json(path)`
-- `prism_dedupe(mol, conf_ids, config)` - Deduplication
+- `rmsd_dedupe(mol, conf_ids, energies=None)` - Conservative Cartesian RMSD deduplication
 
 ## Dependencies
 
 - RDKit >= 2022.03
 - NumPy >= 1.20
-- prism-pruner >= 0.0.3
 
 ## License
 
@@ -496,5 +499,4 @@ If you use openconf in your research, please cite:
 
 ## Acknowledgments
 
-- [PRISM Pruner](https://github.com/ntampellini/prism_pruner) by Nicolò Tampellini for efficient conformer deduplication
 - [RDKit](https://www.rdkit.org/) for cheminformatics infrastructure and the CrystalFF torsion library (Riniker & Landrum, *J. Chem. Inf. Model.* 56, 2016)

@@ -381,7 +381,7 @@ def generate_conformers(
 
     This is the main entry point for conformer generation. It uses
     RDKit ETKDG for seeding, applies torsion-biased moves for exploration,
-    minimizes with MMFF, and deduplicates with PRISM Pruner.
+    minimizes with MMFF, and deduplicates with conservative Cartesian RMSD.
 
     Args:
         mol: molecule or SMILES string

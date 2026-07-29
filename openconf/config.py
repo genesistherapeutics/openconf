@@ -1,5 +1,6 @@
 """Configuration dataclasses for openconf."""
 
+import math
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -45,6 +46,15 @@ def _require_at_least(name: str, value: float, minimum: float) -> None:
 def _require_optional_at_least(name: str, value: float | None, minimum: float) -> None:
     if value is not None:
         _require_at_least(name, value, minimum)
+
+
+def _require_optional_finite_greater_than(
+    name: str,
+    value: float | None,
+    minimum: float,
+) -> None:
+    if value is not None and (not math.isfinite(value) or value <= minimum):
+        raise OpenConfValueError(f"{name} must be finite and > {minimum}, got {value}.")
 
 
 def _require_greater_than(name: str, value: float, minimum: float) -> None:
@@ -241,9 +251,11 @@ class ConformerConfig:
         random_seed: Random seed for reproducibility.
         num_threads: thread count for parallel operations.
         use_heavy_atoms_only: Use only heavy atoms for RMSD calculations.
-        prism_max_deviation: MoI similarity threshold for PRISM deduplication. Two conformers are
-            considered duplicates if all three principal moments differ by less than this fraction.
-            Smaller values mean less aggressive pruning (more conformers survive). Default 0.01 (1%).
+        dedupe_rmsd_threshold: Cartesian RMSD threshold for conformer
+            deduplication. Set to None to disable periodic and final
+            deduplication.
+        dedupe_max_atom_deviation: Maximum aligned displacement allowed for
+            every compared atom. Defaults to twice `dedupe_rmsd_threshold`.
         clash_threshold: Distance threshold for clash detection (Angstroms).
         fast_minimization_iters: Iterations for quick minimization.
         max_minimization_iters: Maximum iterations for minimization.
@@ -391,7 +403,8 @@ class ConformerConfig:
     random_seed: int | None = None
     num_threads: int = 0
     use_heavy_atoms_only: bool = True
-    prism_max_deviation: float = 0.01
+    dedupe_rmsd_threshold: float | None = 0.25
+    dedupe_max_atom_deviation: float | None = None
     constraint_spec: ConstraintSpec | None = None
     clash_threshold: float = 1.5
     fast_minimization_iters: int = 20
@@ -437,6 +450,16 @@ class ConformerConfig:
         _require_at_least("shake_period", self.shake_period, 1)
         _require_at_least("torsion_jitter_deg", self.torsion_jitter_deg, 0.0)
         _require_at_least("num_threads", self.num_threads, 0)
+        _require_optional_finite_greater_than(
+            "dedupe_rmsd_threshold",
+            self.dedupe_rmsd_threshold,
+            0.0,
+        )
+        _require_optional_finite_greater_than(
+            "dedupe_max_atom_deviation",
+            self.dedupe_max_atom_deviation,
+            0.0,
+        )
         _require_greater_than("clash_threshold", self.clash_threshold, 0.0)
         _require_at_least("fast_minimization_iters", self.fast_minimization_iters, 0)
         _require_at_least("max_minimization_iters", self.max_minimization_iters, 0)
@@ -647,7 +670,6 @@ def preset_config(preset: ConformerPreset) -> ConformerConfig:
                 tm_seed_move_attempts=2,
                 seed_n_per_rotor=1,
                 seed_prune_rms_thresh=1.5,
-                prism_max_deviation=0.005,
                 do_final_refine=False,
                 minimize_batch_size=1,
                 parent_strategy="uniform",

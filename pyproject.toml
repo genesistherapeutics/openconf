@@ -10,7 +10,6 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy",
     "rdkit",
-    "prism-pruner>=0.1.2",
 ]
 
 [dependency-groups]

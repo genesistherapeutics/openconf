@@ -15,7 +15,7 @@ from .config import (
     TorsionConstraintSpec,
     preset_config,
 )
-from .dedupe import prism_dedupe
+from .dedupe import rmsd_dedupe
 from .exceptions import OpenConfError, OpenConfRuntimeError, OpenConfValueError
 from .io import mol_to_smiles, read_sdf, read_xyz, smiles_to_mol, write_sdf, write_xyz
 from .perceive import Rotor, RotorModel, build_rotor_model, filter_constrained_rotors, prepare_molecule
@@ -47,9 +47,9 @@ __all__ = [
     "mol_to_smiles",
     "prepare_molecule",
     "preset_config",
-    "prism_dedupe",
     "read_sdf",
     "read_xyz",
+    "rmsd_dedupe",
     "smiles_to_mol",
     "write_sdf",
     "write_xyz",

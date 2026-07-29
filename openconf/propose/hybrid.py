@@ -11,7 +11,7 @@ from rdkit.Geometry import rdGeometry
 
 from ..config import ConformerConfig, ConstraintSpec
 from ..constraints import ConstraintModel, add_constraints_to_force_field
-from ..dedupe import prism_dedupe
+from ..dedupe import rmsd_dedupe
 from ..exceptions import OpenConfValueError
 from ..perceive import RotorModel, _is_metal, filter_constrained_rotors
 from ..pool import ConformerPool
@@ -649,7 +649,7 @@ class HybridProposer:
 
         For every pending (conf_id, move_type): if conf_id is still in the pool
         after dedupe, credit the move with +1 reward; otherwise credit 0 (but
-        still count as an attempt). Pool-overflow eviction and PRISM pruning
+        still count as an attempt). Pool-overflow eviction and RMSD pruning
         are treated identically — both mean "this pose didn't add value" —
         which is the intended signal for acceptance-vs-novelty.
 
@@ -1161,13 +1161,16 @@ def run_hybrid_generation(
         # Post-refinement dedupe: full MMFF geometry changes can merge conformers
         # that were distinct at the fast-minimization stage.
         energy_map_post = dict(zip(final_ids, final_energies, strict=True))
-        final_ids = prism_dedupe(
-            mol,
-            final_ids,
-            use_heavy_atoms_only=effective_config.use_heavy_atoms_only,
-            max_deviation=effective_config.prism_max_deviation,
-        )
-        final_energies = [energy_map_post[cid] for cid in final_ids]
+        if effective_config.dedupe_rmsd_threshold is not None:
+            final_ids = rmsd_dedupe(
+                mol,
+                final_ids,
+                final_energies,
+                use_heavy_atoms_only=effective_config.use_heavy_atoms_only,
+                rmsd_threshold=effective_config.dedupe_rmsd_threshold,
+                max_atom_deviation=effective_config.dedupe_max_atom_deviation,
+            )
+            final_energies = [energy_map_post[cid] for cid in final_ids]
     else:
         # return the fast-minimized energies already stored in the pool
         energy_map = {
@@ -1267,13 +1270,16 @@ def run_low_flex_generation(
         # Post-refinement dedupe: full MMFF geometry changes can merge conformers
         # that were distinct at the fast-minimization stage.
         energy_map_post = dict(zip(final_ids, final_energies, strict=True))
-        final_ids = prism_dedupe(
-            mol,
-            final_ids,
-            use_heavy_atoms_only=config.use_heavy_atoms_only,
-            max_deviation=config.prism_max_deviation,
-        )
-        final_energies = [energy_map_post[cid] for cid in final_ids]
+        if config.dedupe_rmsd_threshold is not None:
+            final_ids = rmsd_dedupe(
+                mol,
+                final_ids,
+                final_energies,
+                use_heavy_atoms_only=config.use_heavy_atoms_only,
+                rmsd_threshold=config.dedupe_rmsd_threshold,
+                max_atom_deviation=config.dedupe_max_atom_deviation,
+            )
+            final_energies = [energy_map_post[cid] for cid in final_ids]
     else:
         energy_map = {
             cid: (rec.energy_kcal if rec.energy_kcal is not None else float("inf")) for cid, rec in pool.records.items()
