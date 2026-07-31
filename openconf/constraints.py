@@ -5,7 +5,7 @@ from typing import Protocol
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdMolTransforms
+from rdkit.Chem import AllChem, rdMolTransforms
 
 from .exceptions import OpenConfValueError
 
@@ -13,6 +13,10 @@ _DEFAULT_POSITION_FORCE_CONSTANT = 1000.0
 _METAL_POSITION_FORCE_CONSTANT = 1e4
 _METAL_LIGAND_DISTANCE_TOLERANCE = 0.05
 _METAL_LIGAND_DISTANCE_FORCE_CONSTANT = 100000.0
+_INTERNAL_FORCE_CONSTANT_CEILINGS = (100.0, 1000.0, 10000.0)
+_DISTANCE_VALIDATION_TOLERANCE = 1e-3
+_ANGLE_VALIDATION_TOLERANCE_DEG = 1e-2
+_CONVERGENCE_RETRY_ATTEMPTS = 2
 
 
 class _BondConstraintSpecLike(Protocol):
@@ -118,6 +122,21 @@ class TorsionConstraint:
     min_dihedral_deg: float
     max_dihedral_deg: float
     force_constant: float
+
+
+@dataclass(frozen=True)
+class ConstraintMinimizationResult:
+    """Result from staged force-field minimization.
+
+    Attributes:
+        energy: final constrained force-field energy
+        converged: whether final force-field minimization converged
+        constraints_satisfied: whether final internal coordinates lie inside their windows
+    """
+
+    energy: float
+    converged: bool
+    constraints_satisfied: bool
 
 
 @dataclass(frozen=True)
@@ -378,6 +397,139 @@ class ConstraintModel:
             torsion_constraints=tuple(torsions[key] for key in sorted(torsions)),
         )
 
+    def reset_position_constraints(self, mol: Chem.Mol, conf_id: int) -> None:
+        """Snap position-constrained atoms to reference coordinates.
+
+        Args:
+            mol: molecule containing conformer
+            conf_id: conformer ID to update
+        """
+        if not self.position_constraints:
+            return
+        conf = mol.GetConformer(int(conf_id))
+        for constraint in self.position_constraints:
+            conf.SetAtomPosition(constraint.atom_idx, constraint.position)
+
+    def internal_coordinates_satisfied(self, mol: Chem.Mol, conf_id: int) -> bool:
+        """Return whether internal coordinates lie inside constraint windows.
+
+        Args:
+            mol: molecule containing conformer
+            conf_id: conformer ID to inspect
+
+        Returns:
+            Whether every distance, angle, and torsion constraint is satisfied
+        """
+        conf = mol.GetConformer(int(conf_id))
+        for constraint in self.distance_constraints:
+            pos_i = conf.GetAtomPosition(int(constraint.atom_i))
+            pos_j = conf.GetAtomPosition(int(constraint.atom_j))
+            distance = float(pos_i.Distance(pos_j))
+            if not (
+                constraint.min_distance - _DISTANCE_VALIDATION_TOLERANCE
+                <= distance
+                <= constraint.max_distance + _DISTANCE_VALIDATION_TOLERANCE
+            ):
+                return False
+        for constraint in self.angle_constraints:
+            angle = float(
+                rdMolTransforms.GetAngleDeg(
+                    conf,
+                    int(constraint.atom_i),
+                    int(constraint.atom_j),
+                    int(constraint.atom_k),
+                )
+            )
+            if not (
+                constraint.min_angle_deg - _ANGLE_VALIDATION_TOLERANCE_DEG
+                <= angle
+                <= constraint.max_angle_deg + _ANGLE_VALIDATION_TOLERANCE_DEG
+            ):
+                return False
+        for constraint in self.torsion_constraints:
+            dihedral = float(
+                rdMolTransforms.GetDihedralDeg(
+                    conf,
+                    int(constraint.atom_i),
+                    int(constraint.atom_j),
+                    int(constraint.atom_k),
+                    int(constraint.atom_l),
+                )
+            )
+            target = 0.5 * (constraint.min_dihedral_deg + constraint.max_dihedral_deg)
+            half_width = 0.5 * (constraint.max_dihedral_deg - constraint.min_dihedral_deg)
+            difference = abs((dihedral - target + 180.0) % 360.0 - 180.0)
+            if difference > half_width + _ANGLE_VALIDATION_TOLERANCE_DEG:
+                return False
+        return True
+
+    def _with_internal_force_ceiling(self, ceiling: float) -> "ConstraintModel":
+        """Return model with internal force constants capped at ceiling.
+
+        Args:
+            ceiling: maximum internal-coordinate force constant
+
+        Returns:
+            Constraint model with capped internal-coordinate force constants
+        """
+        return ConstraintModel(
+            position_constraints=self.position_constraints,
+            distance_constraints=tuple(
+                DistanceConstraint(
+                    constraint.atom_i,
+                    constraint.atom_j,
+                    constraint.min_distance,
+                    constraint.max_distance,
+                    min(constraint.force_constant, ceiling),
+                )
+                for constraint in self.distance_constraints
+            ),
+            angle_constraints=tuple(
+                AngleConstraint(
+                    constraint.atom_i,
+                    constraint.atom_j,
+                    constraint.atom_k,
+                    constraint.min_angle_deg,
+                    constraint.max_angle_deg,
+                    min(constraint.force_constant, ceiling),
+                )
+                for constraint in self.angle_constraints
+            ),
+            torsion_constraints=tuple(
+                TorsionConstraint(
+                    constraint.atom_i,
+                    constraint.atom_j,
+                    constraint.atom_k,
+                    constraint.atom_l,
+                    constraint.min_dihedral_deg,
+                    constraint.max_dihedral_deg,
+                    min(constraint.force_constant, ceiling),
+                )
+                for constraint in self.torsion_constraints
+            ),
+        )
+
+    def minimization_stages(self, mol: Chem.Mol, conf_id: int) -> tuple["ConstraintModel", ...]:
+        """Return progressively stronger constraint models for minimization.
+
+        Args:
+            mol: molecule containing conformer
+            conf_id: conformer ID to inspect
+
+        Returns:
+            Constraint models ordered from weak preconditioning to requested strengths
+        """
+        internal_constraints = (*self.distance_constraints, *self.angle_constraints, *self.torsion_constraints)
+        if not internal_constraints or self.internal_coordinates_satisfied(mol, conf_id):
+            return (self,)
+        max_force_constant = max(constraint.force_constant for constraint in internal_constraints)
+        stages = tuple(
+            self._with_internal_force_ceiling(ceiling)
+            for ceiling in _INTERNAL_FORCE_CONSTANT_CEILINGS
+            if ceiling < max_force_constant
+        )
+        return (*stages, self)
+
     def reset_positions(self, mol: Chem.Mol, conf_id: int) -> None:
         """Snap constrained atoms and distances back to reference geometry.
 
@@ -485,3 +637,72 @@ def add_constraints_to_force_field(ff: object, constraints: ConstraintModel, fam
                 float(constraint.max_dihedral_deg),
                 float(constraint.force_constant),
             )
+
+
+def minimize_with_constraints(
+    mol: Chem.Mol,
+    conf_id: int,
+    constraints: ConstraintModel,
+    max_iters: int,
+    mmff_props: object | None = None,
+    require_convergence: bool = False,
+) -> ConstraintMinimizationResult | None:
+    """Minimize conformer using progressively stronger geometry restraints.
+
+    Position-constrained atoms are restored before force-field construction so
+    RDKit anchors them to their reference coordinates. Internal-coordinate force
+    constants are ramped only when current geometry is outside a requested window,
+    avoiding ill-conditioned first steps without directly rewriting connectivity.
+
+    Args:
+        mol: molecule containing conformer
+        conf_id: conformer ID to minimize
+        constraints: geometry constraints to apply
+        max_iters: maximum iterations for each force-constant stage
+        mmff_props: MMFF properties, or None to use UFF
+        require_convergence: retry final stage and report convergence status
+
+    Returns:
+        Minimization result, or None when force-field construction fails
+    """
+    constraints.reset_position_constraints(mol, conf_id)
+    family = "MMFF" if mmff_props is not None else "UFF"
+    final_ff: object | None = None
+    status = 1
+
+    for staged_constraints in constraints.minimization_stages(mol, conf_id):
+        if mmff_props is not None:
+            final_ff = AllChem.MMFFGetMoleculeForceField(mol, mmff_props, confId=int(conf_id))
+        else:
+            final_ff = AllChem.UFFGetMoleculeForceField(mol, confId=int(conf_id))
+        if final_ff is None:
+            return None
+        add_constraints_to_force_field(final_ff, staged_constraints, family)
+        minimize = getattr(final_ff, "Minimize", None)
+        if minimize is None:
+            return None
+        status = int(minimize(maxIts=int(max_iters)))
+
+    if require_convergence and max_iters > 0:
+        minimize = getattr(final_ff, "Minimize", None)
+        for _ in range(_CONVERGENCE_RETRY_ATTEMPTS):
+            if status == 0 or minimize is None:
+                break
+            status = int(minimize(maxIts=int(max_iters)))
+
+    constraints.reset_positions(mol, conf_id)
+    if mmff_props is not None:
+        evaluation_ff = AllChem.MMFFGetMoleculeForceField(mol, mmff_props, confId=int(conf_id))
+    else:
+        evaluation_ff = AllChem.UFFGetMoleculeForceField(mol, confId=int(conf_id))
+    if evaluation_ff is None:
+        return None
+    add_constraints_to_force_field(evaluation_ff, constraints, family)
+    calc_energy = getattr(evaluation_ff, "CalcEnergy", None)
+    if calc_energy is None:
+        return None
+    return ConstraintMinimizationResult(
+        energy=float(calc_energy()),
+        converged=status == 0,
+        constraints_satisfied=constraints.internal_coordinates_satisfied(mol, conf_id),
+    )

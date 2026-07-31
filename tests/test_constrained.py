@@ -429,9 +429,21 @@ def test_explicit_internal_coordinate_constraints_do_not_require_reference_confo
         minimize_batch_size=1,
         random_seed=0,
         constraint_spec=ConstraintSpec(
-            bond_constraints=(BondConstraintSpec(1, 2, distance=1.54, tolerance=0.02),),
-            angle_constraints=(AngleConstraintSpec(0, 1, 2, angle_deg=112.0, tolerance_deg=2.0),),
-            torsion_constraints=(TorsionConstraintSpec(0, 1, 2, 3, dihedral_deg=180.0, tolerance_deg=2.0),),
+            bond_constraints=(BondConstraintSpec(1, 2, distance=1.54, tolerance=0.02, force_constant=100000.0),),
+            angle_constraints=(
+                AngleConstraintSpec(0, 1, 2, angle_deg=112.0, tolerance_deg=2.0, force_constant=100000.0),
+            ),
+            torsion_constraints=(
+                TorsionConstraintSpec(
+                    0,
+                    1,
+                    2,
+                    3,
+                    dihedral_deg=180.0,
+                    tolerance_deg=2.0,
+                    force_constant=100000.0,
+                ),
+            ),
         ),
     )
     ensemble = generate_conformers("CCCC", config=config)
@@ -446,6 +458,67 @@ def test_explicit_internal_coordinate_constraints_do_not_require_reference_confo
         assert abs(distance - 1.54) <= 0.04
         assert abs(angle - 112.0) <= 3.0
         assert abs(((torsion - 180.0 + 180.0) % 360.0) - 180.0) <= 3.0
+
+
+def test_staged_constraint_minimization_preserves_position_anchors():
+    """Angle restraint must not move position-constrained downstream atoms."""
+    from rdkit.Chem import rdMolTransforms
+
+    from openconf.constraints import (
+        AngleConstraint,
+        ConstraintModel,
+        PositionConstraint,
+        minimize_with_constraints,
+    )
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCCC"))
+    AllChem.EmbedMolecule(mol, randomSeed=1)
+    AllChem.MMFFOptimizeMolecule(mol)
+    conf = mol.GetConformer(0)
+    reference = conf.GetAtomPosition(3)
+    reference_position = (float(reference.x), float(reference.y), float(reference.z))
+    reference_bond = conf.GetAtomPosition(2).Distance(reference)
+    initial_angle = rdMolTransforms.GetAngleDeg(conf, 0, 1, 2)
+    constraints = ConstraintModel(
+        position_constraints=(PositionConstraint(3, reference_position),),
+        angle_constraints=(AngleConstraint(0, 1, 2, initial_angle + 28.0, initial_angle + 32.0, 1000.0),),
+    )
+    props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s")
+
+    result = minimize_with_constraints(
+        mol,
+        0,
+        constraints,
+        200,
+        mmff_props=props,
+        require_convergence=True,
+    )
+
+    assert result is not None
+    assert result.converged
+    assert result.constraints_satisfied
+    assert conf.GetAtomPosition(3).Distance(reference) <= 1e-9
+    assert abs(conf.GetAtomPosition(2).Distance(conf.GetAtomPosition(3)) - reference_bond) <= 0.01
+
+
+def test_staged_constraint_minimization_does_not_rewrite_ring_coordinates():
+    """Zero-iteration constrained minimization must leave ring geometry unchanged."""
+    from openconf.constraints import ConstraintModel, DistanceConstraint, minimize_with_constraints
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("c1ccccc1"))
+    AllChem.EmbedMolecule(mol, randomSeed=1)
+    conf = mol.GetConformer(0)
+    initial_positions = conf.GetPositions().copy()
+    initial_distance = conf.GetAtomPosition(0).Distance(conf.GetAtomPosition(1))
+    constraints = ConstraintModel(
+        distance_constraints=(DistanceConstraint(0, 1, initial_distance + 0.5, initial_distance + 0.5, 1000.0),)
+    )
+    props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s")
+
+    result = minimize_with_constraints(mol, 0, constraints, 0, mmff_props=props)
+
+    assert result is not None
+    assert np.allclose(conf.GetPositions(), initial_positions, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------

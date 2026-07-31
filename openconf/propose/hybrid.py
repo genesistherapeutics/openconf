@@ -10,7 +10,7 @@ from rdkit.Chem import AllChem
 from rdkit.Geometry import rdGeometry
 
 from ..config import ConformerConfig, ConstraintSpec
-from ..constraints import ConstraintModel, add_constraints_to_force_field
+from ..constraints import ConstraintModel, minimize_with_constraints
 from ..dedupe import rmsd_dedupe
 from ..exceptions import OpenConfValueError
 from ..perceive import RotorModel, _is_metal, filter_constrained_rotors
@@ -334,28 +334,11 @@ class HybridProposer:
 
         return seed_results
 
-    def _reset_constraint_positions(self, mol: Chem.Mol, conf_id: int) -> None:
-        """Snap position-constrained atoms back to exact reference coordinates.
-
-        Called after every constrained minimization to eliminate any residual
-        drift that the position restraints did not fully suppress.
-
-        Args:
-            mol: molecule containing conformer
-            conf_id: conformer ID to update in place
-        """
-        self.constraint_model.reset_positions(mol, conf_id)
-
     def _minimize_uff_single(self, mol: Chem.Mol, conf_id: int, max_its: int) -> float:
         """UFF-minimize one conformer with metal position/distance constraints."""
-        ff = AllChem.UFFGetMoleculeForceField(mol, confId=int(conf_id))
-        if ff is None:
-            return float("inf")
-        add_constraints_to_force_field(ff, self.constraint_model, "UFF")
         try:
-            ff.Minimize(maxIts=max_its)
-            self._reset_constraint_positions(mol, conf_id)
-            return float(ff.CalcEnergy())
+            result = minimize_with_constraints(mol, conf_id, self.constraint_model, max_its)
+            return result.energy if result is not None else float("inf")
         except (ValueError, RuntimeError):
             return float("inf")
 
@@ -427,27 +410,16 @@ class HybridProposer:
         props = getattr(minimizer, "_mmff_props", None)
 
         try:
-            if props is not None:
-                ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=int(conf_id))
-                if ff is None:
-                    return float("inf")
-                add_constraints_to_force_field(ff, self.constraint_model, "MMFF")
-                ff.Minimize(maxIts=int(minimizer.max_iters))
-                energy = float(ff.CalcEnergy())
-            else:
-                ff = AllChem.UFFGetMoleculeForceField(mol, confId=int(conf_id))
-                if ff is None:
-                    return float("inf")
-                add_constraints_to_force_field(ff, self.constraint_model, "UFF")
-                ff.Minimize(maxIts=int(minimizer.max_iters))
-                energy = float(ff.CalcEnergy())
+            result = minimize_with_constraints(
+                mol,
+                conf_id,
+                self.constraint_model,
+                minimizer.max_iters,
+                mmff_props=props,
+            )
         except (ValueError, RuntimeError):
             return float("inf")
-
-        # Snap constrained atoms back to exact reference coordinates, eliminating
-        # any residual drift that the position restraints did not fully suppress.
-        self._reset_constraint_positions(mol, conf_id)
-        return energy
+        return result.energy if result is not None else float("inf")
 
     def _propose_constrained(self, pool: ConformerPool, step: int) -> tuple[int, float, str] | None:
         """Propose a single conformer using constrained minimization.
@@ -921,26 +893,21 @@ class HybridProposer:
 
         for cid in final_ids:
             try:
-                if props is not None:
-                    ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=int(cid))
-                    if ff is None:
-                        energies.append(float("inf"))
-                        continue
-                    add_constraints_to_force_field(ff, self.constraint_model, "MMFF")
-                    ff.Minimize(maxIts=int(max_iters))
-                    energies.append(float(ff.CalcEnergy()))
-                else:
-                    ff = AllChem.UFFGetMoleculeForceField(mol, confId=int(cid))
-                    if ff is None:
-                        energies.append(float("inf"))
-                        continue
-                    add_constraints_to_force_field(ff, self.constraint_model, "UFF")
-                    ff.Minimize(maxIts=int(max_iters))
-                    energies.append(float(ff.CalcEnergy()))
+                result = minimize_with_constraints(
+                    mol,
+                    cid,
+                    self.constraint_model,
+                    max_iters,
+                    mmff_props=props,
+                    require_convergence=True,
+                )
             except (ValueError, RuntimeError):
                 energies.append(float("inf"))
                 continue
-            self._reset_constraint_positions(mol, cid)
+            if result is None or not result.converged or not result.constraints_satisfied:
+                energies.append(float("inf"))
+            else:
+                energies.append(result.energy)
 
         return energies
 

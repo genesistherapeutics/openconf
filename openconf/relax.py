@@ -6,7 +6,7 @@ from typing import Protocol
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from .constraints import ConstraintModel, add_constraints_to_force_field
+from .constraints import ConstraintModel, minimize_with_constraints
 from .exceptions import OpenConfValueError
 
 
@@ -71,15 +71,6 @@ class RDKitMMFFMinimizer:
         metal_constraints = ConstraintModel.from_metal_shell(mol, self.metal_atom_indices)
         self._prepared_constraints = metal_constraints.combine(self.constraint_model)
 
-    def _reset_constrained_positions(self, mol: Chem.Mol, conf_id: int) -> None:
-        """Snap position-constrained atoms back to reference coordinates.
-
-        Args:
-            mol: molecule containing conformer
-            conf_id: conformer ID to update
-        """
-        self._prepared_constraints.reset_positions(mol, conf_id)
-
     def minimize(self, mol: Chem.Mol, conf_id: int) -> float:
         """Minimize conformer in place and return energy in kcal/mol.
 
@@ -91,18 +82,14 @@ class RDKitMMFFMinimizer:
             Energy in kcal/mol after minimization
         """
         try:
-            if self._mmff_props is not None:
-                ff = AllChem.MMFFGetMoleculeForceField(mol, self._mmff_props, confId=int(conf_id))
-                family = "MMFF"
-            else:
-                ff = AllChem.UFFGetMoleculeForceField(mol, confId=int(conf_id))
-                family = "UFF"
-            if ff is None:
-                return float("inf")
-            add_constraints_to_force_field(ff, self._prepared_constraints, family)
-            ff.Minimize(maxIts=int(self.max_iters))
-            self._reset_constrained_positions(mol, conf_id)
-            return float(ff.CalcEnergy())
+            result = minimize_with_constraints(
+                mol,
+                conf_id,
+                self._prepared_constraints,
+                self.max_iters,
+                mmff_props=self._mmff_props,
+            )
+            return result.energy if result is not None else float("inf")
         except (ValueError, RuntimeError):
             return float("inf")
 
