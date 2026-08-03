@@ -9,6 +9,14 @@
 
 *a conformer generator for drug-like molecules: uses torsional Monte Carlo moves to quickly generate diverse ensembles, uses RDKit/MMFF94s throughout, and runs fast enough for large-scale workflows.*
 
+## Overview
+
+`openconf` is a tool for rapid conformer generation. From an input 2D or 3D structure, `openconf` quickly uses a variety of techniques (primarily torsional Monte Carlo moves) to generate an ensemble of reasonable conformers; `openconf` aims to do this as quickly as is reasonable, exposing all relevant scientific degrees of freedom to the caller.
+
+`openconf` is deliberately dependency-light and limited in scope. Clustering, conformer selection, and high-level optimization & reranking are considered out of scope for `openconf` and will not be included; instead, users are encouraged to integrate `openconf` into their own end-to-end computational workflows.
+
+`openconf` is primarily developed and maintained by Rowan Scientific.
+
 ## Installation
 
 ```bash
