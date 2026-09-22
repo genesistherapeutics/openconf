@@ -390,7 +390,7 @@ class ConformerPool:
             self.config.dedupe_max_atom_deviation,
         )
         trusted_ids: set[int] = set()
-        if settings == self._dedupe_settings:
+        if not self.config.use_heavy_atoms_only and settings == self._dedupe_settings:
             # Only previous winners with the same energy and geometry can reuse that proof.
             for conf_id, energy in zip(conf_ids, energies, strict=True):
                 previous = self._dedupe_snapshot.get(conf_id)
@@ -410,12 +410,16 @@ class ConformerPool:
             max_atom_deviation=self.config.dedupe_max_atom_deviation,
             _trusted_ids=frozenset(trusted_ids),
         )
-        energy_by_id = dict(zip(conf_ids, energies, strict=True))
-        self._dedupe_snapshot = {
-            conf_id: (energy_by_id[conf_id], self.mol.GetConformer(conf_id).GetPositions().copy())
-            for conf_id in keep_ids
-        }
-        self._dedupe_settings = settings
+        if self.config.use_heavy_atoms_only:
+            self._dedupe_snapshot = {}
+            self._dedupe_settings = None
+        else:
+            energy_by_id = dict(zip(conf_ids, energies, strict=True))
+            self._dedupe_snapshot = {
+                conf_id: (energy_by_id[conf_id], self.mol.GetConformer(conf_id).GetPositions().copy())
+                for conf_id in keep_ids
+            }
+            self._dedupe_settings = settings
 
         # Remove duplicates
         keep_set = set(keep_ids)
