@@ -261,6 +261,8 @@ class ConformerPool:
     _worst_id: int | None = field(default=None, init=False)
     _worst_dirty: bool = field(default=False, init=False)
     _records_version: int = field(default=0, init=False)
+    _dedupe_snapshot: dict[int, tuple[float, np.ndarray]] = field(default_factory=dict, init=False, repr=False)
+    _dedupe_settings: tuple[bool, float, float | None] | None = field(default=None, init=False, repr=False)
     _parent_sampler: ParentSampler = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -381,15 +383,39 @@ class ConformerPool:
 
         # Get current conf_ids
         conf_ids = self.conf_ids
+        energies = self.energies
+        settings = (
+            self.config.use_heavy_atoms_only,
+            self.config.dedupe_rmsd_threshold,
+            self.config.dedupe_max_atom_deviation,
+        )
+        trusted_ids: set[int] = set()
+        if settings == self._dedupe_settings:
+            # Only previous winners with the same energy and geometry can reuse that proof.
+            for conf_id, energy in zip(conf_ids, energies, strict=True):
+                previous = self._dedupe_snapshot.get(conf_id)
+                if (
+                    previous is not None
+                    and previous[0] == energy
+                    and np.array_equal(previous[1], self.mol.GetConformer(conf_id).GetPositions())
+                ):
+                    trusted_ids.add(conf_id)
 
         keep_ids = rmsd_dedupe(
             self.mol,
             conf_ids,
-            self.energies,
+            energies,
             use_heavy_atoms_only=self.config.use_heavy_atoms_only,
             rmsd_threshold=self.config.dedupe_rmsd_threshold,
             max_atom_deviation=self.config.dedupe_max_atom_deviation,
+            _trusted_ids=frozenset(trusted_ids),
         )
+        energy_by_id = dict(zip(conf_ids, energies, strict=True))
+        self._dedupe_snapshot = {
+            conf_id: (energy_by_id[conf_id], self.mol.GetConformer(conf_id).GetPositions().copy())
+            for conf_id in keep_ids
+        }
+        self._dedupe_settings = settings
 
         # Remove duplicates
         keep_set = set(keep_ids)

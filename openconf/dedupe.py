@@ -23,6 +23,7 @@ def rmsd_dedupe(
     use_heavy_atoms_only: bool = True,
     rmsd_threshold: float = 0.25,
     max_atom_deviation: float | None = None,
+    _trusted_ids: frozenset[int] | None = None,
 ) -> list[int]:
     """Deduplicate conformers using fixed-correspondence Cartesian RMSD.
 
@@ -40,6 +41,8 @@ def rmsd_dedupe(
         rmsd_threshold: RMSD below which conformers are duplicates
         max_atom_deviation: maximum aligned displacement allowed for every
             compared atom; defaults to twice `rmsd_threshold`
+        _trusted_ids: previously retained conformers known to be pairwise distinct
+            under unchanged coordinates, energies, and thresholds
 
     Returns:
         Retained conformer identifiers
@@ -72,11 +75,17 @@ def rmsd_dedupe(
     atom_indices = _selected_atom_indices(mol, use_heavy_atoms_only)
     coordinates = _extract_coordinates(mol, ordered_ids, atom_indices)
     permutation_groups = () if use_heavy_atoms_only else _same_parent_hydrogen_groups(mol)
+    trusted_mask = (
+        np.fromiter((conf_id in _trusted_ids for conf_id in ordered_ids), dtype=bool, count=len(ordered_ids))
+        if _trusted_ids
+        else None
+    )
     mask = _prune_coordinates(
         coordinates,
         rmsd_threshold=rmsd_threshold,
         max_atom_deviation=max_atom_deviation,
         permutation_groups=permutation_groups,
+        trusted_mask=trusted_mask,
     )
     return [conf_id for conf_id, keep in zip(ordered_ids, mask, strict=True) if keep]
 
@@ -123,6 +132,7 @@ def _prune_coordinates(
     rmsd_threshold: float,
     max_atom_deviation: float,
     permutation_groups: Sequence[IntArray],
+    trusted_mask: NDArray[np.bool_] | None = None,
 ) -> NDArray[np.bool_]:
     centered = coordinates - coordinates.mean(axis=1, keepdims=True)
     radial_distances = np.linalg.norm(centered, axis=2)
@@ -141,6 +151,12 @@ def _prune_coordinates(
             continue
 
         reference_indices = np.asarray(kept_indices, dtype=np.intp)
+        if trusted_mask is not None and trusted_mask[candidate_index]:
+            # Unchanged winners from the previous pass are already pairwise distinct.
+            reference_indices = reference_indices[~trusted_mask[reference_indices]]
+            if not len(reference_indices):
+                kept_indices.append(candidate_index)
+                continue
         radial_differences = radial_distances[reference_indices] - radial_distances[candidate_index]
         squared_radial_differences = radial_differences**2
         viable = (np.mean(squared_radial_differences, axis=1) < rmsd_threshold**2) & (
@@ -193,6 +209,23 @@ def _superpose_to_references(
     return np.einsum("kma,kab->kmb", centered_candidates, left @ right_transpose)
 
 
+def _trial_covariances(
+    centered_references: FloatArray,
+    centered_candidate: FloatArray,
+    mapping: IntArray,
+    current_covariance: FloatArray,
+    group: IntArray,
+    arrangements: IntArray,
+) -> FloatArray:
+    """Update Kabsch covariance for each local hydrogen arrangement."""
+    mapped = centered_candidate[mapping]
+    old_contribution = np.einsum("kga,kgb->kab", mapped[:, group], centered_references[:, group])
+    new_contribution = np.einsum(
+        "pga,kgb->kpab", centered_candidate[group[arrangements]], centered_references[:, group]
+    )
+    return current_covariance[:, None] - old_contribution[:, None] + new_contribution
+
+
 def _aligned_metrics_with_permutations(
     centered_references: FloatArray,
     centered_candidate: FloatArray,
@@ -207,9 +240,9 @@ def _aligned_metrics_with_permutations(
     correspondence can make the correct arrangement look worse than the identity and strand
     the search at a fixed point.
 
-    All references and all arrangements of a group are superposed in one batch, which is
-    what makes this affordable: the work is unchanged but it lands in a handful of stacked
-    SVD calls instead of one call per reference per arrangement.
+    Trial Kabsch covariances update only the atoms in the current hydrogen group. Singular
+    values rank their RMSDs; full aligned metrics are calculated for the selected arrangement
+    and for all arrangements when the ranking is numerically close.
 
     Args:
         centered_references: origin-centred reference coordinates
@@ -228,32 +261,72 @@ def _aligned_metrics_with_permutations(
     rows = np.arange(reference_count)
     mapping = np.broadcast_to(np.arange(atom_count, dtype=np.intp), (reference_count, atom_count)).copy()
     best_rmsds, best_maxima = _metrics_for_mappings(centered_references, centered_candidate, mapping)
+    current_rmsds = best_rmsds.copy()
+    current_maxima = best_maxima.copy()
+    current_covariance = np.einsum("kma,kmb->kab", centered_candidate[mapping], centered_references)
+    reference_norms = np.sum(centered_references**2, axis=(1, 2))
+    candidate_norm = np.sum(centered_candidate**2)
 
     for _ in range(_PERMUTATION_SWEEPS):
         changed = False
         for group, arrangements in zip(permutation_groups, group_permutations, strict=True):
-            trial_count = len(arrangements)
-            trials = np.repeat(mapping[:, None, :], trial_count, axis=1)
-            trials[:, :, group] = group[arrangements]
-            trial_rmsds, trial_maxima = _metrics_for_mappings(
-                np.repeat(centered_references[:, None], trial_count, axis=1).reshape(-1, atom_count, 3),
-                centered_candidate,
-                trials.reshape(-1, atom_count),
+            covariances = _trial_covariances(
+                centered_references, centered_candidate, mapping, current_covariance, group, arrangements
             )
-            trial_rmsds = trial_rmsds.reshape(reference_count, trial_count)
-            trial_maxima = trial_maxima.reshape(reference_count, trial_count)
+            left, singular_values, right_transpose = np.linalg.svd(covariances)
+            reflections = np.linalg.det(left @ right_transpose) < 0
+            signed_singular_values = singular_values.copy()
+            signed_singular_values[reflections, -1] *= -1
+            rmsd_squared = (
+                candidate_norm + reference_norms[:, None] - 2 * np.sum(signed_singular_values, axis=-1)
+            ) / atom_count
+            trial_rmsds = np.sqrt(np.maximum(rmsd_squared, 0))
 
-            # The current arrangement is always among the trials, so it supplies the
-            # baseline that a replacement has to beat outright.
+            proposed = np.argmin(trial_rmsds, axis=1)
             current = np.all(group[arrangements][None] == mapping[:, group][:, None], axis=2).argmax(axis=1)
-            tie_break = np.broadcast_to(np.arange(trial_count), (reference_count, trial_count))
-            proposed = np.lexsort((tie_break, trial_maxima, trial_rmsds), axis=1)[:, 0]
+            proposed_mapping = mapping.copy()
+            proposed_mapping[:, group] = group[arrangements[proposed]]
+            proposed_rmsds, proposed_maxima = _metrics_for_mappings(
+                centered_references, centered_candidate, proposed_mapping
+            )
+
+            # Re-evaluate close trial RMSDs with the original aligned metric so ties
+            # still break on maximum atom deviation and arrangement order.
+            if len(arrangements) > 1:
+                sorted_rmsds = np.sort(trial_rmsds, axis=1)
+                ambiguous = sorted_rmsds[:, 1] - sorted_rmsds[:, 0] < 1e-7
+                ambiguous_rows = np.flatnonzero(ambiguous)
+                if len(ambiguous_rows):
+                    trial_mappings = np.repeat(mapping[ambiguous_rows, None], len(arrangements), axis=1)
+                    trial_mappings[:, :, group] = group[arrangements]
+                    exact_rmsds, exact_maxima = _metrics_for_mappings(
+                        np.repeat(centered_references[ambiguous_rows, None], len(arrangements), axis=1).reshape(
+                            -1, atom_count, 3
+                        ),
+                        centered_candidate,
+                        trial_mappings.reshape(-1, atom_count),
+                    )
+                    exact_rmsds = exact_rmsds.reshape(-1, len(arrangements))
+                    exact_maxima = exact_maxima.reshape(-1, len(arrangements))
+                    tie_break = np.broadcast_to(np.arange(len(arrangements)), exact_rmsds.shape)
+                    proposed[ambiguous_rows] = np.lexsort((tie_break, exact_maxima, exact_rmsds), axis=1)[:, 0]
+                    proposed_rmsds[ambiguous_rows] = exact_rmsds[
+                        np.arange(len(ambiguous_rows)), proposed[ambiguous_rows]
+                    ]
+                    proposed_maxima[ambiguous_rows] = exact_maxima[
+                        np.arange(len(ambiguous_rows)), proposed[ambiguous_rows]
+                    ]
+                    current_rmsds[ambiguous_rows] = exact_rmsds[np.arange(len(ambiguous_rows)), current[ambiguous_rows]]
+                    current_maxima[ambiguous_rows] = exact_maxima[
+                        np.arange(len(ambiguous_rows)), current[ambiguous_rows]
+                    ]
+
             chosen = np.where(
                 _strictly_better(
-                    trial_rmsds[rows, proposed],
-                    trial_maxima[rows, proposed],
-                    trial_rmsds[rows, current],
-                    trial_maxima[rows, current],
+                    proposed_rmsds,
+                    proposed_maxima,
+                    current_rmsds,
+                    current_maxima,
                 ),
                 proposed,
                 current,
@@ -262,9 +335,12 @@ def _aligned_metrics_with_permutations(
                 mapping[:, group] = group[arrangements[chosen]]
                 changed = True
 
-            improved = _strictly_better(trial_rmsds[rows, chosen], trial_maxima[rows, chosen], best_rmsds, best_maxima)
-            best_rmsds = np.where(improved, trial_rmsds[rows, chosen], best_rmsds)
-            best_maxima = np.where(improved, trial_maxima[rows, chosen], best_maxima)
+            current_covariance = covariances[rows, chosen]
+            current_rmsds = np.where(chosen == proposed, proposed_rmsds, current_rmsds)
+            current_maxima = np.where(chosen == proposed, proposed_maxima, current_maxima)
+            improved = _strictly_better(current_rmsds, current_maxima, best_rmsds, best_maxima)
+            best_rmsds = np.where(improved, current_rmsds, best_rmsds)
+            best_maxima = np.where(improved, current_maxima, best_maxima)
         if not changed:
             break
 

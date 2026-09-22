@@ -151,6 +151,46 @@ def test_none_rmsd_threshold_disables_pool_deduplication() -> None:
     assert pool.conf_ids == [0, 1]
 
 
+def test_pool_reuses_only_unchanged_previous_winners() -> None:
+    """New winners and changed coordinates still displace cached survivors."""
+    reference = np.array([[0.0, 0.0, 0.0], [1.0, 0.2, 0.0], [0.1, 1.3, 0.4], [0.3, 0.1, 1.7]])
+    distinct = reference.copy()
+    distinct[3, 2] += 1.0
+    duplicate = reference + np.array([3.0, -2.0, 1.0])
+    mol = _mol_with_conformers([6] * 4, [reference, distinct, duplicate])
+    pool = ConformerPool(
+        mol=mol,
+        config=ConformerConfig(max_out=3, pool_max=3, dedupe_rmsd_threshold=0.1, use_heavy_atoms_only=False),
+    )
+    assert pool.insert(0, 2.0)
+    assert pool.insert(1, 1.0)
+    assert pool.dedupe() == 0
+    assert pool.insert(2, 0.0)
+    assert pool.dedupe() == 1
+    assert set(pool.conf_ids) == {1, 2}
+
+    # Mutating a previous winner invalidates its cached pairwise comparisons.
+    for atom_index, (x, y, z) in enumerate(duplicate):
+        pool.mol.GetConformer(1).SetAtomPosition(atom_index, Point3D(float(x), float(y), float(z)))
+    assert pool.dedupe() == 1
+    assert pool.conf_ids == [2]
+
+
+def test_pool_does_not_trust_protected_duplicate() -> None:
+    """Protected duplicate kept in pool does not become trusted winner."""
+    reference = np.array([[0.0, 0.0, 0.0], [1.0, 0.2, 0.0], [0.1, 1.3, 0.4], [0.3, 0.1, 1.7]])
+    duplicate = reference + np.array([2.0, 3.0, -1.0])
+    mol = _mol_with_conformers([6] * 4, [reference, duplicate])
+    pool = ConformerPool(mol=mol, config=ConformerConfig(max_out=2, pool_max=2, dedupe_rmsd_threshold=0.1))
+    assert pool.insert(0, 0.0)
+    assert pool.insert(1, 1.0, tags={"protected": True})
+    assert pool.dedupe() == 0
+    assert pool.conf_ids == [0, 1]
+    pool.records[1].tags["protected"] = False
+    assert pool.dedupe() == 1
+    assert pool.conf_ids == [0]
+
+
 def test_reported_nmr_molecule_retains_four_post_refinement_states() -> None:
     """Reported chiral NMR regression retains four Cartesian representatives."""
     config = ConformerConfig(
