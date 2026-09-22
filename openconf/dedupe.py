@@ -10,6 +10,10 @@ from rdkit import Chem
 type FloatArray = NDArray[np.float64]
 type IntArray = NDArray[np.intp]
 
+# Rotation and permutation assignment each depend on the other, so they are refined in
+# alternating sweeps. Convergence is detected, so this is only an upper bound.
+_PERMUTATION_SWEEPS = 4
+
 
 def rmsd_dedupe(
     mol: Chem.Mol,
@@ -125,9 +129,13 @@ def _prune_coordinates(
     for group in permutation_groups:
         radial_distances[:, group] = np.sort(radial_distances[:, group], axis=1)
 
+    group_permutations = tuple(
+        np.asarray(list(permutations(range(len(group)))), dtype=np.intp) for group in permutation_groups
+    )
+
     keep = np.ones(len(coordinates), dtype=bool)
     kept_indices: list[int] = []
-    for candidate_index, candidate in enumerate(coordinates):
+    for candidate_index in range(len(coordinates)):
         if not kept_indices:
             kept_indices.append(candidate_index)
             continue
@@ -142,22 +150,19 @@ def _prune_coordinates(
 
         if not len(viable_reference_indices):
             is_duplicate = False
-        elif permutation_groups:
-            is_duplicate = any(
-                _is_similar(
-                    coordinates[reference_index],
-                    candidate,
-                    rmsd_threshold,
-                    max_atom_deviation,
-                    permutation_groups,
-                )
-                for reference_index in viable_reference_indices
-            )
         else:
-            rmsds, max_deviations = _aligned_metrics_to_centered_references(
-                centered[viable_reference_indices],
-                centered[candidate_index],
-            )
+            if permutation_groups:
+                rmsds, max_deviations = _aligned_metrics_with_permutations(
+                    centered[viable_reference_indices],
+                    centered[candidate_index],
+                    permutation_groups,
+                    group_permutations,
+                )
+            else:
+                rmsds, max_deviations = _aligned_metrics_to_centered_references(
+                    centered[viable_reference_indices],
+                    centered[candidate_index],
+                )
             is_duplicate = bool(np.any((rmsds < rmsd_threshold) & (max_deviations < max_atom_deviation)))
 
         if is_duplicate:
@@ -168,80 +173,147 @@ def _prune_coordinates(
     return keep
 
 
-def _is_similar(
-    reference: FloatArray,
-    candidate: FloatArray,
-    rmsd_threshold: float,
-    max_atom_deviation: float,
+def _superpose_to_references(
+    centered_references: FloatArray,
+    centered_candidates: FloatArray,
+) -> FloatArray:
+    """Rotate every candidate onto its paired reference with a proper-rotation Kabsch fit.
+
+    Args:
+        centered_references: origin-centred reference coordinates, one per reference
+        centered_candidates: origin-centred candidate coordinates, one per reference
+
+    Returns:
+        Candidate coordinates rotated onto their references
+    """
+    covariance = np.einsum("kma,kmb->kab", centered_candidates, centered_references)
+    left, _, right_transpose = np.linalg.svd(covariance)
+    reflections = np.linalg.det(left @ right_transpose) < 0
+    left[reflections, :, -1] *= -1
+    return np.einsum("kma,kab->kmb", centered_candidates, left @ right_transpose)
+
+
+def _aligned_metrics_with_permutations(
+    centered_references: FloatArray,
+    centered_candidate: FloatArray,
     permutation_groups: Sequence[IntArray],
-) -> bool:
-    rmsd, maximum = _aligned_rmsd_and_max(
-        reference,
-        candidate,
-        permutation_groups,
-    )
-    return rmsd < rmsd_threshold and maximum < max_atom_deviation
+    group_permutations: Sequence[IntArray],
+) -> tuple[FloatArray, FloatArray]:
+    """Align one candidate to every reference, permuting equivalent atoms within groups.
 
+    Refines one group at a time, keeping an arrangement only when it strictly improves
+    (RMSD, maximum deviation), and stops once a sweep changes nothing. Each arrangement is
+    scored under its own superposition, because a rotation fitted to the wrong atom
+    correspondence can make the correct arrangement look worse than the identity and strand
+    the search at a fixed point.
 
-def _aligned_rmsd_and_max(
-    reference: FloatArray,
-    candidate: FloatArray,
-    permutation_groups: Sequence[IntArray],
-) -> tuple[float, float]:
-    mapping = np.arange(len(reference), dtype=np.intp)
-    best_rmsd, best_maximum, *_ = _aligned_metrics(reference, candidate)
+    All references and all arrangements of a group are superposed in one batch, which is
+    what makes this affordable: the work is unchanged but it lands in a handful of stacked
+    SVD calls instead of one call per reference per arrangement.
 
-    for _ in range(4):
+    Args:
+        centered_references: origin-centred reference coordinates
+        centered_candidate: origin-centred candidate coordinates
+        permutation_groups: atom indices whose assignment may permute
+        group_permutations: arrangements to consider per group, ordered as permutation_groups
+
+    Returns:
+        Best per-reference RMSD and maximum aligned atom displacement found
+
+    Note:
+        Returns the best metrics seen during refinement, which need not come from the final
+        arrangement, matching the behaviour of the scalar search this replaces.
+    """
+    reference_count, atom_count = centered_references.shape[:2]
+    rows = np.arange(reference_count)
+    mapping = np.broadcast_to(np.arange(atom_count, dtype=np.intp), (reference_count, atom_count)).copy()
+    best_rmsds, best_maxima = _metrics_for_mappings(centered_references, centered_candidate, mapping)
+
+    for _ in range(_PERMUTATION_SWEEPS):
         changed = False
-        for group in permutation_groups:
-            group_mapping = mapping
-            group_rmsd, group_maximum, *_ = _aligned_metrics(
-                reference,
-                candidate[mapping],
+        for group, arrangements in zip(permutation_groups, group_permutations, strict=True):
+            trial_count = len(arrangements)
+            trials = np.repeat(mapping[:, None, :], trial_count, axis=1)
+            trials[:, :, group] = group[arrangements]
+            trial_rmsds, trial_maxima = _metrics_for_mappings(
+                np.repeat(centered_references[:, None], trial_count, axis=1).reshape(-1, atom_count, 3),
+                centered_candidate,
+                trials.reshape(-1, atom_count),
             )
-            for permutation in permutations(group.tolist()):
-                trial_mapping = mapping.copy()
-                trial_mapping[group] = permutation
-                rmsd, maximum, *_ = _aligned_metrics(
-                    reference,
-                    candidate[trial_mapping],
-                )
-                if (rmsd, maximum) < (group_rmsd, group_maximum):
-                    group_mapping = trial_mapping
-                    group_rmsd = rmsd
-                    group_maximum = maximum
+            trial_rmsds = trial_rmsds.reshape(reference_count, trial_count)
+            trial_maxima = trial_maxima.reshape(reference_count, trial_count)
 
-            if not np.array_equal(group_mapping, mapping):
-                mapping = group_mapping
+            # The current arrangement is always among the trials, so it supplies the
+            # baseline that a replacement has to beat outright.
+            current = np.all(group[arrangements][None] == mapping[:, group][:, None], axis=2).argmax(axis=1)
+            tie_break = np.broadcast_to(np.arange(trial_count), (reference_count, trial_count))
+            proposed = np.lexsort((tie_break, trial_maxima, trial_rmsds), axis=1)[:, 0]
+            chosen = np.where(
+                _strictly_better(
+                    trial_rmsds[rows, proposed],
+                    trial_maxima[rows, proposed],
+                    trial_rmsds[rows, current],
+                    trial_maxima[rows, current],
+                ),
+                proposed,
+                current,
+            )
+            if not np.array_equal(chosen, current):
+                mapping[:, group] = group[arrangements[chosen]]
                 changed = True
-            if (group_rmsd, group_maximum) < (best_rmsd, best_maximum):
-                best_rmsd = group_rmsd
-                best_maximum = group_maximum
+
+            improved = _strictly_better(trial_rmsds[rows, chosen], trial_maxima[rows, chosen], best_rmsds, best_maxima)
+            best_rmsds = np.where(improved, trial_rmsds[rows, chosen], best_rmsds)
+            best_maxima = np.where(improved, trial_maxima[rows, chosen], best_maxima)
         if not changed:
             break
 
-    return best_rmsd, best_maximum
+    return best_rmsds, best_maxima
 
 
-def _aligned_metrics(
-    reference: FloatArray,
-    candidate: FloatArray,
-) -> tuple[float, float, FloatArray]:
-    reference_centered = reference - reference.mean(axis=0)
-    candidate_centered = candidate - candidate.mean(axis=0)
-    covariance = candidate_centered.T @ reference_centered
-    left, _, right_transpose = np.linalg.svd(covariance)
-    if np.linalg.det(left @ right_transpose) < 0:
-        left[:, -1] *= -1
-    rotation = left @ right_transpose
+def _strictly_better(
+    rmsds: FloatArray,
+    maxima: FloatArray,
+    reference_rmsds: FloatArray,
+    reference_maxima: FloatArray,
+) -> NDArray[np.bool_]:
+    """Compare (RMSD, maximum deviation) pairs lexicographically.
+
+    Args:
+        rmsds: candidate RMSD values
+        maxima: candidate maximum deviations
+        reference_rmsds: RMSD values to beat
+        reference_maxima: maximum deviations to beat
+
+    Returns:
+        Whether each candidate pair sorts strictly before its reference pair
+    """
+    return (rmsds < reference_rmsds) | ((rmsds == reference_rmsds) & (maxima < reference_maxima))
+
+
+def _metrics_for_mappings(
+    centered_references: FloatArray,
+    centered_candidate: FloatArray,
+    mappings: IntArray,
+) -> tuple[FloatArray, FloatArray]:
+    """Superpose a candidate onto references under per-reference atom mappings.
+
+    Args:
+        centered_references: origin-centred reference coordinates
+        centered_candidate: origin-centred candidate coordinates
+        mappings: candidate atom index per reference and position
+
+    Returns:
+        Per-reference RMSD and maximum aligned atom displacement
+    """
+    candidates = np.broadcast_to(centered_candidate, (len(mappings), *centered_candidate.shape))
+    permuted = np.take_along_axis(candidates, mappings[..., None], 1)
     displacements = np.linalg.norm(
-        candidate_centered @ rotation - reference_centered,
-        axis=1,
+        _superpose_to_references(centered_references, permuted) - centered_references, axis=2
     )
     return (
-        float(np.sqrt(np.mean(displacements**2))),
-        float(np.max(displacements)),
-        rotation,
+        np.sqrt(np.mean(displacements**2, axis=1)),
+        np.max(displacements, axis=1),
     )
 
 
